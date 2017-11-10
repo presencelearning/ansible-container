@@ -59,7 +59,7 @@ class HostCommand(object):
                           # 'purge': 'Delete all Ansible Container instances, volumes, and images',
                           # FIXME: implement status command
                           # 'status': 'Query the status of your project's containers/images',
-                          'deploy': 'Deploy your built images into production'
+                          'deploy': 'Deploy your built images into production',
                           }
 
     def subcmd_common_parsers(self, parser, subparser, cmd):
@@ -71,6 +71,10 @@ class HostCommand(object):
                                    help=u'Mount one or more volumes to the Conductor. '
                                         u'Specify volumes as strings using the Docker volume format.',
                                    default=[])
+            subparser.add_argument('--volume-driver', action='store',
+                                   help=u'Specify volume driver to use when mounting named volumes '
+                                        u'to the Conductor.',
+                                   default=None)
             subparser.add_argument('--with-variables', '-e', action='store', nargs='+',
                                    help=u'Define one or more environment variables in the '
                                         u'Conductor. Format each variable as a key=value string.',
@@ -150,6 +154,10 @@ class HostCommand(object):
                                     u'into target containers in order to run Ansible. Use when the target '
                                     u'already has an installed Python runtime.',
                                dest='local_python', default=False)
+        subparser.add_argument('--src-mount-path', action='store',
+                               help=u'Specify the host path that should be mounted to the conductor at /src.'
+                                    u'Defaults to the directory from which ansible-container was invoked.',
+                               dest='src_mount_path', default=None)
         subparser.add_argument('ansible_options', action='store',
                                help=u'Provide additional commandline arguments to '
                                     u'Ansible in executing your playbook. If you '
@@ -312,9 +320,16 @@ class HostCommand(object):
         except exceptions.AnsibleContainerDockerConnectionRefused:
             logger.error('The connection to Docker was refused. Check your Docker environment configuration.',
                          exc_info=False)
+        except exceptions.AnsibleContainerDockerConnectionAborted as e:
+            logger.error('The connection to Docker was aborted. Check your Docker environment configuration.\n'
+                         'ErrorMessage: %s' % str(e),
+                         exc_info=False)
             sys.exit(1)
         except exceptions.AnsibleContainerConfigException as e:
             logger.error('Invalid container.yml: {}'.format(e), exc_info=False)
+            sys.exit(1)
+        except exceptions.AnsibleContainerRequestException as e:
+            logger.error("Invalid request: {}".format(e), exc_info=False)
             sys.exit(1)
         except requests.exceptions.ConnectionError:
             logger.error('Could not connect to container host. Check your docker config', exc_info=False)
@@ -341,7 +356,6 @@ class HostCommand(object):
             sys.exit(1)
 
 host_commandline = HostCommand()
-
 
 def decode_b64json(encoded_params):
     # Using object_pairs_hook to preserve the original order of any dictionaries

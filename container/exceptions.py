@@ -32,6 +32,9 @@ class AnsibleContainerDockerLoginException(AnsibleContainerException):
 class AnsibleContainerDockerConnectionRefused(AnsibleContainerException):
     pass
 
+class AnsibleContainerDockerConnectionAborted(AnsibleContainerException):
+    pass
+
 class AnsibleContainerConfigException(AnsibleContainerException):
     pass
 
@@ -78,4 +81,7 @@ class AnsibleContainerImportDirDockerException(AnsibleContainerException):
     pass
 
 class AnsibleContainerImportExistsException(AnsibleContainerException):
+    pass
+
+class AnsibleContainerRequestException(AnsibleContainerException):
     pass

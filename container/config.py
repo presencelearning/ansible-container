@@ -12,11 +12,11 @@ from os import path
 import copy
 import json
 import re
-from six import add_metaclass, iteritems, PY2, string_types
+from six import add_metaclass, iteritems, PY2, string_types, text_type
 
 from collections import Mapping
+from .utils.ordereddict import ordereddict
 from ruamel import yaml
-
 import container
 
 if container.ENV == 'conductor':
@@ -26,7 +26,8 @@ if container.ENV == 'conductor':
     except ImportError:
         from ansible.vars.unsafe_proxy import AnsibleUnsafeText
 
-from .exceptions import AnsibleContainerConfigException, AnsibleContainerNotInitializedException
+from .exceptions import (AnsibleContainerConfigException, AnsibleContainerNotInitializedException,
+                         AnsibleContainerRequestException)
 from .utils import get_metadata_from_role, get_defaults_from_role
 
 # jag: Division of labor between outer utility and conductor:
@@ -46,7 +47,7 @@ DEFAULT_CONDUCTOR_BASE = 'centos:7'
 
 @add_metaclass(ABCMeta)
 class BaseAnsibleContainerConfig(Mapping):
-    _config = yaml.compat.ordereddict()
+    _config = ordereddict()
     base_path = None
     engine_list = ['docker', 'openshift', 'k8s']
 
@@ -63,7 +64,7 @@ class BaseAnsibleContainerConfig(Mapping):
 
     @property
     def deployment_path(self):
-        dep_path = self.get('settings', yaml.compat.ordereddict()).get('deployment_output_path',
+        dep_path = self.get('settings', ordereddict()).get('deployment_output_path',
                             path.join(self.base_path, 'ansible-deployment/'))
         return path.normpath(path.abspath(path.expanduser(path.expandvars(dep_path))))
 
@@ -71,10 +72,14 @@ class BaseAnsibleContainerConfig(Mapping):
     def project_name(self):
         if self.cli_project_name:
             # Give precedence to CLI args
+            self._validate_project_name(self.cli_project_name)
             return self.cli_project_name
         if self._config.get('settings', {}).get('project_name', None):
             # Look for settings.project_name
+            self._validate_project_name(self._config['settings']['project_name'])
             return self._config['settings']['project_name']
+        logger.info("Setting project_name not defined. Fallback to current directory name.")
+        self._validate_project_name(os.path.basename(self.base_path))
         return os.path.basename(self.base_path)
 
     @property
@@ -112,8 +117,48 @@ class BaseAnsibleContainerConfig(Mapping):
         # When pushing images or deploying, we need to know the default namespace
         pass
 
+    def get_conductor_environment(self):
+        """
+        Return a copy of settings.conductor.environment + any undefined environment variables found in 
+        any service definitions. Sets any undefined variables to corresponding variables found in the 
+        local environment. 
+        """  
+        conductor_env = copy.deepcopy(self._config.get('settings', {}).get('conductor', {}).get('environment', {}))
+        if isinstance(conductor_env, list):
+            # convert to a dict 
+            new_env = {}
+            for item in [e.split('=', 1) for e in conductor_env if '=' in e]:
+                new_env[item[0]] = item[1]
+            for item in [e for e in conductor_env if '=' not in e]:
+                new_env[item] = None
+            conductor_env = new_env
+         
+        for name, options in iteritems(self._config['services']):
+            if options.get('environment'):
+                if isinstance(options['environment'], list):
+                    for e in options['environment']:
+                        if '=' not in e and os.environ.get(e) and not conductor_env.get(e):
+                            conductor_env[e] = os.environ[e]
+                elif isinstance(options['environment'], dict):
+                    for key, value in iteritems(options['environment']):
+                        if value is None and os.environ.get(key) and not conductor_env.get(key):
+                            conductor_env[key] = os.environ[key]    
+
+        for key in conductor_env.keys():
+            if conductor_env[key] is None:
+                conductor_env[key] = os.environ.get(key)
+
+        return conductor_env 
+
+    def set_conductor_environment(self, environment):
+        if self._config.get('settings') is None: 
+            self._config['settings'] = {}
+        if self._config['settings'].get('conductor') is None:
+            self._config['settings']['conductor'] = {}
+        self._config['settings']['conductor']['environment'] = environment
+
     @abstractmethod
-    def set_env(self, env):
+    def set_env(self, env, config=None):
         """
         Loads config from container.yml,  and stores the resulting dict to self._config.
 
@@ -121,12 +166,14 @@ class BaseAnsibleContainerConfig(Mapping):
         :return: None
         """
         assert env in ['dev', 'prod']
-        try:
-            config = yaml.round_trip_load(open(self.config_path))
-        except IOError:
-            raise AnsibleContainerNotInitializedException()
-        except yaml.YAMLError as exc:
-            raise AnsibleContainerConfigException(u"Parsing container.yml - %s" % unicode(exc))
+
+        if not config:
+            try:
+                config = yaml.round_trip_load(open(self.config_path))
+            except IOError:
+                raise AnsibleContainerNotInitializedException()
+            except yaml.YAMLError as exc:
+                raise AnsibleContainerConfigException(u"Parsing container.yml - %s" % text_type(exc))
 
         self._validate_config(config)
 
@@ -134,32 +181,53 @@ class BaseAnsibleContainerConfig(Mapping):
             if not service_config or isinstance(service_config, string_types):
                 raise AnsibleContainerConfigException(u"Error: no definition found in container.yml for service %s."
                                                       % service)
-            if isinstance(service_config, dict):
-                dev_overrides = service_config.pop('dev_overrides', {})
-                if env == 'dev':
-                    service_config.update(dev_overrides)
-            if 'volumes' in service_config:
-                # Expand ~, ${HOME}, ${PWD}, etc. found in the volume src path
-                updated_volumes = []
-                for volume in service_config['volumes']:
-                    vol_pieces = volume.split(':')
-                    vol_pieces[0] = path.normpath(path.expandvars(path.expanduser(vol_pieces[0])))
-                    updated_volumes.append(':'.join(vol_pieces))
-                service_config['volumes'] = updated_volumes
-
-            for engine_name in self.remove_engines:
-                if engine_name in service_config:
-                    del service_config[engine_name]
+            self._update_service_config(env, service_config)
 
         # Insure settings['pwd'] = base_path. Will be used later by conductor to resolve $PWD in volumes.
         if config.get('settings', None) is None:
-            config['settings'] = yaml.compat.ordereddict()
+            config['settings'] = ordereddict()
         config['settings']['pwd'] = self.base_path
 
         self._resolve_defaults(config)
 
         logger.debug(u"Parsed config", config=config)
         self._config = config
+
+    def set_services(self, services):
+        if not services:
+            return
+        remove_services = list(set(self._config['services']) - set(services))
+        if remove_services:
+            for service in remove_services:
+                del self._config['services'][service]
+
+    def check_requested_services(self, services):
+        if not services:
+            return
+        missing_services = list(set(services) - set(self._config['services'].keys()))
+        if missing_services:
+            tense = '' if len(missing_services) <= 1 else 's'
+            raise AnsibleContainerRequestException(
+                "Requested service{} {} not defined in container.yml".format(tense, ', '.join(missing_services))
+            )
+
+    def _update_service_config(self, env, service_config):
+        if isinstance(service_config, dict):
+            dev_overrides = service_config.pop('dev_overrides', {})
+            if env == 'dev':
+                service_config.update(dev_overrides)
+        if 'volumes' in service_config:
+            # Expand ~, ${HOME}, ${PWD}, etc. found in the volume src path
+            updated_volumes = []
+            for volume in service_config['volumes']:
+                vol_pieces = volume.split(':')
+                vol_pieces[0] = path.normpath(path.expandvars(path.expanduser(vol_pieces[0])))
+                updated_volumes.append(':'.join(vol_pieces))
+            service_config['volumes'] = updated_volumes
+
+        for engine_name in self.remove_engines:
+            if engine_name in service_config:
+                del service_config[engine_name]
 
     def _resolve_defaults(self, config):
         """
@@ -171,7 +239,7 @@ class BaseAnsibleContainerConfig(Mapping):
         """
         if config.get('defaults'):
             # convert config['defaults'] to an ordereddict()
-            tmp_defaults = yaml.compat.ordereddict()
+            tmp_defaults = ordereddict()
             tmp_defaults.update(copy.deepcopy(config['defaults']), relax=True)
             config['defaults'] = tmp_defaults
         defaults = config.setdefault('defaults', yaml.compat.ordereddict())
@@ -182,7 +250,7 @@ class BaseAnsibleContainerConfig(Mapping):
                 defaults.update(self._get_variables_from_file(var_file=var_file), relax=True)
 
         logger.debug('The default type is', defaults=str(type(defaults)), config=str(type(config)))
-        if PY2 and type(defaults) == yaml.compat.ordereddict:
+        if PY2 and type(defaults) == ordereddict:
             defaults.update(self._get_environment_variables(), relax=True)
         else:
             defaults.update(self._get_environment_variables())
@@ -195,10 +263,10 @@ class BaseAnsibleContainerConfig(Mapping):
         key is the result of removing 'AC_' from the variable name and converting the remainder to lowercase.
         For example, 'AC_DEBUG=1' becomes 'debug: 1'.
 
-        :return ruamel.yaml.compat.ordereddict
+        :return ruamel.ordereddict
         '''
         logger.debug(u'Getting environment variables...')
-        env_vars = yaml.compat.ordereddict()
+        env_vars = ordereddict()
         for var, value in ((k, v) for k, v in os.environ.items()
                            if k.startswith('AC_')):
             env_vars[var[3:].lower()] = value
@@ -210,7 +278,7 @@ class BaseAnsibleContainerConfig(Mapping):
         Looks for file relative to base_path. If not found, checks relative to base_path/ansible.
         If file extension is .yml | .yaml, parses as YAML, otherwise parses as JSON.
 
-        :return: ruamel.yaml.compat.ordereddict
+        :return: ruamel.ordereddict
         """
         abspath = path.abspath(var_file)
         if not path.exists(abspath):
@@ -224,12 +292,12 @@ class BaseAnsibleContainerConfig(Mapping):
             try:
                 config = yaml.round_trip_load(open(abspath))
             except yaml.YAMLError as exc:
-                raise AnsibleContainerConfigException(u"YAML exception: %s" % unicode(exc))
+                raise AnsibleContainerConfigException(u"YAML exception: %s" % text_type(exc))
         else:
             try:
                 config = json.load(open(abspath))
             except Exception as exc:
-                raise AnsibleContainerConfigException(u"JSON exception: %s" % unicode(exc))
+                raise AnsibleContainerConfigException(u"JSON exception: %s" % text_type(exc))
         return iteritems(config)
 
     TOP_LEVEL_WHITELIST = [
@@ -268,7 +336,16 @@ class BaseAnsibleContainerConfig(Mapping):
                     logger.warning("Version '1' is deprecated. Consider upgrading to version '2'.")
             else:
                 if config[top_level] is None:
-                    config[top_level] = yaml.compat.ordereddict()
+                    config[top_level] = ordereddict()
+
+    def _validate_project_name(self, project_name):
+        """
+        Validates that the project_name starts with an alphanumeric value.
+        Raises an Exception if the project_name is invalid
+        """
+        if re.match(r"^[a-zA-Z0-9]{1}.*", project_name) == None:
+            raise AnsibleContainerConfigException(u"Invalid project_name {0}\n".format(project_name)
+                + u"The project_name has to start with an alphanumeric character.")
 
     def __getitem__(self, item):
         return self._config[item]
@@ -294,7 +371,7 @@ class AnsibleContainerConductorConfig(Mapping):
     def _process_section(self, section_value, callback=None, templar=None):
         if not templar:
             templar = self._templar
-        processed = yaml.compat.ordereddict()
+        processed = ordereddict()
         for key, value in section_value.items():
             if isinstance(value, string_types):
                 # strings can be templated
@@ -319,7 +396,7 @@ class AnsibleContainerConductorConfig(Mapping):
     def _process_defaults(self):
         logger.debug('Processing defaults section...')
         self.defaults = self._process_section(
-            self._config.get('defaults', yaml.compat.ordereddict()),
+            self._config.get('defaults', ordereddict()),
             callback=lambda processed: self._templar.set_available_variables(
                 dict(processed)))
 
@@ -327,13 +404,13 @@ class AnsibleContainerConductorConfig(Mapping):
         self._config['settings'] = self._config.get('settings', yaml.compat.ordereddict())
         for section in ['volumes', 'registries', 'secrets']:
             logger.debug('Processing section...', section=section)
-            setattr(self, section, dict(self._process_section(self._config.get(section, yaml.compat.ordereddict()))))
+            setattr(self, section, dict(self._process_section(self._config.get(section, ordereddict()))))
 
     def _process_services(self):
-        services = yaml.compat.ordereddict()
-        for service, service_data in self._config.get('services', yaml.compat.ordereddict()).items():
+        services = ordereddict()
+        for service, service_data in self._config.get('services', ordereddict()).items():
             logger.debug('Processing service...', service=service, service_data=service_data)
-            processed = yaml.compat.ordereddict()
+            processed = ordereddict()
             service_defaults = self.defaults.copy()
             for idx in range(len(service_data.get('volumes', []))):
                 # To mount the project directory, let users specify `$PWD` and

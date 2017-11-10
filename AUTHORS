@@ -8,26 +8,28 @@ Shubham Minglani <shubham@linux.com>
 Matt Clay <matt@mystile.com>
 Pierre-Louis Bonicoli <pierre-louis@libregerbil.fr>
 Greg DeKoenigsberg <greg.dekoenigsberg@gmail.com>
+Marc Sensenich <marc-sensenich@users.noreply.github.com>
 Sandra Wills <swills@ansible.com>
 Eric D. Helms <ericdhelms@gmail.com>
 Dusty Mabe <dusty@dustymabe.com>
 Eric D Helms <eric.d.helms@gmail.com>
 Josiah Goodson <josiah.goodson@gmail.com>
 Dominik del Bondio <dominik.del.bondio@bitextender.com>
+Marcus Levine <marcusianl@gmail.com>
 Dylan Silva <thaumos@users.noreply.github.com>
 Tomas Tomecek <ttomecek@redhat.com>
 Fabian von Feilitzsch <fabianvf@users.noreply.github.com>
 Charlie Drage <charlie@charliedrage.com>
-Marcus Levine <marcusianl@gmail.com>
 Roderick Randolph <roderickrandolph@users.noreply.github.com>
 Will Refvem <wbrefvem@gmail.com>
 Sebastien Plisson <sebastien.plisson@gmail.com>
 Mike Hume <mhumeSF@gmail.com>
 Gerard Braad <me@gbraad.nl>
+ekultails <ekultails@gmail.com>
 Evgeni Golov <evgeni@golov.de>
+Joseph Callen <jcpowermac@gmail.com>
 Will Thames <wthames@redhat.com>
 Vadim Rutkovsky <roignac@gmail.com>
-Joseph Callen <jcpowermac@gmail.com>
 Grzegorz Nosek <root@localdomain.pl>
 Abhishek Pratap Singh <abhishek@linux.com>
 Todd Barr <tbarr@ansible.com>
@@ -40,9 +42,8 @@ marc-sensenich <marc-sensenich@users.noreply.github.com>
 Ted Timmons <ted@perljam.net>
 Bruce Becker <brucellino@gmail.com>
 Jeff Geerling <geerlingguy@mac.com>
-Marc Sensenich <marc-sensenich@users.noreply.github.com>
 Evan Zeimet <evan.zeimet@cdw.com>
-ekultails <ekultails@gmail.com>
+Theo Nolasco <theo.nolasco@gmail.com>
 John Matthews <jwmatthews@gmail.com>
 Sean Summers <ssummer3@nd.edu>
 Alex Yanchenko <alex@yanchenko.com>
@@ -53,3 +54,4 @@ szinck1 <szinck@gmail.com>
 Erik Nelson <erik@nsk.io>
 Chrrrles Paul <chrrrles@users.noreply.github.com>
 Andrea De Pirro <andrea.depirro@yameveo.com>
+Jordan Mcmillan <jormcmil@opendns.com>

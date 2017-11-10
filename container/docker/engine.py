@@ -20,8 +20,10 @@ import sys
 import tarfile
 
 from ruamel.yaml.comments import CommentedMap
-from six import reraise, iteritems, string_types
+from six import reraise, iteritems, string_types, PY3
 
+if PY3:
+    from functools import reduce
 try:
     import httplib as StatusCodes
 except ImportError:
@@ -31,7 +33,8 @@ import container
 from container import host_only, conductor_only
 from container.engine import BaseEngine
 from container import utils, exceptions
-from container.utils import logmux, text, ordereddict_to_list
+from container.utils import (logmux, text, ordereddict_to_list, roles_to_install, modules_to_install,
+                             ansible_config_exists, create_file)
 from .secrets import DockerSecretsMixin
 
 try:
@@ -71,6 +74,22 @@ DOCKER_CONFIG_FILEPATH_CASCADE = [
 
 REMOVE_HTTP = re.compile('^https?://')
 
+# A map of distros and their aliases that we build pre-baked builders for
+PREBAKED_DISTROS = {
+    'centos:7': ['centos:latest', 'centos:centos7'],
+    'fedora:26': ['fedora:latest'],
+    'fedora:25': [],
+    'fedora:24': [],
+    'debian:jessie': ['debian:8', 'debian:latest', 'debian:jessie-slim'],
+    'debian:stretch': ['debian:9', 'debian:stretch-slim'],
+    'debian:wheezy': ['debian:7', 'debian:wheezy-slim'],
+    'ubuntu:precise': ['ubuntu:12.04'],
+    'ubuntu:trusty': ['ubuntu:14.04'],
+    'ubuntu:xenial': ['ubuntu:16.04'],
+    'ubuntu:zesty': ['ubuntu:17.04'],
+    'alpine:3.5': ['alpine:latest'],
+    'alpine:3.4': []
+}
 
 def log_runs(fn):
     @functools.wraps(fn)
@@ -147,6 +166,8 @@ class Engine(BaseEngine, DockerSecretsMixin):
             except DockerException as exc:
                 if 'Connection refused' in str(exc):
                     raise exceptions.AnsibleContainerDockerConnectionRefused()
+                elif 'Connection aborted' in str(exc):
+                    raise exceptions.AnsibleContainerDockerConnectionAborted(u"%s" % str(exc))
                 else:
                     raise
         return self._client
@@ -180,16 +201,39 @@ class Engine(BaseEngine, DockerSecretsMixin):
 
     @property
     def secrets_mount_path(self):
-        return os.path.join(os.sep, 'run', 'secrets')
+        return os.path.join(os.sep, 'docker', 'secrets')
 
     def container_name_for_service(self, service_name):
         return u'%s_%s' % (self.project_name, service_name)
 
     def image_name_for_service(self, service_name):
-        if service_name == 'conductor' or self.services[service_name].get('roles'):
+        if service_name == 'conductor':
             return u'%s-%s' % (self.project_name.lower(), service_name.lower())
-        else:
-            return self.services[service_name].get('from')
+        result = None
+        for name, service in iteritems(self.services):
+            if service.get('containers'):
+                for c in service['containers']:
+                    container_service_name = u"%s-%s" % (name, c['container_name'])
+                    if container_service_name == service_name:
+                        if c.get('roles'):
+                            result = u'%s-%s' % (self.project_name.lower(), container_service_name.lower())
+                        else:
+                            result = c.get('from')
+                        break
+            elif name == service_name:
+                if service.get('roles'):
+                    result = u'%s-%s' % (self.project_name.lower(), name.lower())
+                else:
+                    result = service.get('from')
+            if result:
+                break
+
+        if result is None:
+            raise exceptions.AnsibleContainerConfigException(
+                u"Failed to resolve image for service {}. The service or container definition "
+                u"is likely missing a 'from' attribute".format(service_name)
+            )
+        return result
 
     def run_kwargs_for_service(self, service_name):
         to_return = self.services[service_name].copy()
@@ -291,7 +335,11 @@ class Engine(BaseEngine, DockerSecretsMixin):
             params['vault_files'] = vault_paths
 
         permissions = 'ro' if command != 'install' else 'rw'
-        volumes[base_path] = {'bind': '/src', 'mode': permissions}
+        if params.get('src_mount_path'):
+            src_path = params['src_mount_path']
+        else:
+            src_path = base_path
+        volumes[src_path] = {'bind': '/src', 'mode': permissions}
 
         if params.get('deployment_output_path'):
             deployment_path = params['deployment_output_path']
@@ -353,6 +401,7 @@ class Engine(BaseEngine, DockerSecretsMixin):
 
         if command in ('login', 'push', 'build'):
             config_path = params.get('config_path') or self.auth_config_path
+            create_file(config_path, '{}')
             volumes[config_path] = {'bind': config_path,
                                     'mode': 'rw'}
 
@@ -382,6 +431,10 @@ class Engine(BaseEngine, DockerSecretsMixin):
         # Anytime a playbook is executed, /src is bind mounted to a tmpdir, and that seems to
         # require privileged=True
         run_kwargs['privileged'] = True
+
+        # Support optional volume driver for mounting named volumes to the Conductor
+        if params.get('volume_driver'):
+            run_kwargs['volume_driver'] = params['volume_driver']
 
         logger.debug('Docker run:', image=image_id, params=run_kwargs)
         try:
@@ -820,16 +873,108 @@ class Engine(BaseEngine, DockerSecretsMixin):
                 line = json.loads(line)
                 if type(line) is dict and 'error' in line:
                     plainLogger.error(line['error'])
-                if type(line) is dict and 'status' in line:
+                    raise exceptions.AnsibleContainerException(
+                        "Failed to push image. {}".format(line['error'])
+                    )
+                elif type(line) is dict and 'status' in line:
                     if line['status'] != last_status:
                         plainLogger.info(line['status'])
                     last_status = line['status']
                 else:
                     plainLogger.debug(line)
 
+    @staticmethod
+    def _prepare_prebake_manifest(base_path, base_image, temp_dir, tarball):
+        utils.jinja_render_to_temp(TEMPLATES_PATH,
+                                   'conductor-src-dockerfile.j2', temp_dir,
+                                   'Dockerfile',
+                                   conductor_base=base_image,
+                                   docker_version=DOCKER_VERSION)
+        tarball.add(os.path.join(temp_dir, 'Dockerfile'),
+                    arcname='Dockerfile')
+
+        container_dir = os.path.dirname(container.__file__)
+        tarball.add(container_dir, arcname='container-src')
+        package_dir = os.path.dirname(container_dir)
+
+        # For an editable install, the setup.py and requirements.* will be
+        # available in the package_dir. Otherwise, our custom sdist (see
+        # setup.py) would have moved them to FILES_PATH
+        setup_py_dir = (package_dir
+                        if os.path.exists(os.path.join(package_dir, 'setup.py'))
+                        else FILES_PATH)
+        req_txt_dir = (package_dir
+                       if os.path.exists(
+            os.path.join(package_dir, 'conductor-requirements.txt'))
+                       else FILES_PATH)
+        req_yml_dir = (package_dir
+                       if os.path.exists(
+            os.path.join(package_dir, 'conductor-requirements.yml'))
+                       else FILES_PATH)
+        tarball.add(os.path.join(setup_py_dir, 'setup.py'),
+                    arcname='container-src/conductor-build/setup.py')
+        tarball.add(os.path.join(req_txt_dir, 'conductor-requirements.txt'),
+                    arcname='container-src/conductor-build/conductor'
+                            '-requirements.txt')
+        tarball.add(os.path.join(req_yml_dir, 'conductor-requirements.yml'),
+                    arcname='container-src/conductor-build/conductor-requirements.yml')
+
+    def _prepare_conductor_manifest(self, base_path, base_image, temp_dir, tarball):
+        source_dir = os.path.normpath(base_path)
+
+        for filename in ['ansible.cfg', 'ansible-requirements.txt',
+                         'requirements.yml']:
+            file_path = os.path.join(source_dir, filename)
+            if os.path.exists(filename):
+                tarball.add(file_path,
+                            arcname=os.path.join('build-src', filename))
+        # Make an empty file just to make sure the build-src dir has something
+        open(os.path.join(temp_dir, '.touch'), 'w')
+        tarball.add(os.path.join(temp_dir, '.touch'),
+                    arcname='build-src/.touch')
+
+        prebaked = base_image in reduce(lambda x, y: x + [y[0]] + y[1],
+                                        PREBAKED_DISTROS.items(), [])
+        if prebaked:
+            base_image = [k for k, v in PREBAKED_DISTROS.items()
+                              if base_image in [k] + v][0]
+            conductor_base = 'container-conductor-%s:%s' % (
+                base_image.replace(':', '-'),
+                container.__version__
+            )
+            if not self.get_image_id_by_tag(conductor_base):
+                conductor_base = 'ansible/%s' % conductor_base
+        else:
+            conductor_base = 'container-conductor-%s:%s' % (
+                base_image.replace(':', '-'),
+                container.__version__
+            )
+
+        run_commands = []
+        if modules_to_install(base_path):
+            run_commands.append('pip install --no-cache-dir -r /_ansible/build/ansible-requirements.txt')
+        if roles_to_install(base_path):
+            run_commands.append('ansible-galaxy install -p /etc/ansible/roles -r /_ansible/build/requirements.yml')
+        if ansible_config_exists(base_path):
+            run_commands.append('cp /_ansible/build/ansible.cfg /etc/ansible/ansible.cfg')
+        separator = ' && \\\r\n'
+        install_requirements = separator.join(run_commands)
+
+        utils.jinja_render_to_temp(TEMPLATES_PATH,
+                                   'conductor-local-dockerfile.j2', temp_dir,
+                                   'Dockerfile',
+                                   install_requirements=install_requirements,
+                                   original_base=base_image,
+                                   conductor_base=conductor_base,
+                                   docker_version=DOCKER_VERSION)
+        tarball.add(os.path.join(temp_dir, 'Dockerfile'),
+                    arcname='Dockerfile')
+
     @log_runs
     @host_only
-    def build_conductor_image(self, base_path, base_image, cache=True, environment=[]):
+    def build_conductor_image(self, base_path, base_image, prebaking=False, cache=True, environment=None):
+        if environment is None:
+            environment = []
         with utils.make_temp_dir() as temp_dir:
             logger.info('Building Docker Engine context...')
             tarball_path = os.path.join(temp_dir, 'context.tar')
@@ -875,7 +1020,7 @@ class Engine(BaseEngine, DockerSecretsMixin):
                         arcname='container-src/conductor-build/conductor-requirements.yml')
 
             utils.jinja_render_to_temp(TEMPLATES_PATH,
-                                       'conductor-dockerfile.j2', temp_dir,
+                                       'conductor-src-dockerfile.j2', temp_dir,
                                        'Dockerfile',
                                        conductor_base=base_image,
                                        docker_version=DOCKER_VERSION,
@@ -888,6 +1033,16 @@ class Engine(BaseEngine, DockerSecretsMixin):
             #    tarball.add(os.path.join(TEMPLATES_PATH, context_file),
             #                arcname=context_file)
 
+            if prebaking:
+                self.client.images.pull(*base_image.split(':', 1))
+                self._prepare_prebake_manifest(base_path, base_image, temp_dir,
+                                               tarball)
+                tag = 'container-conductor-%s:%s' % (base_image.replace(':', '-'),
+                                                     container.__version__)
+            else:
+                self._prepare_conductor_manifest(base_path, base_image, temp_dir,
+                                                 tarball)
+                tag = self.image_name_for_service('conductor')
             logger.debug('Context manifest:')
             for tarinfo_obj in tarball.getmembers():
                 logger.debug('tarball item: %s (%s bytes)', tarinfo_obj.name,
@@ -899,20 +1054,20 @@ class Engine(BaseEngine, DockerSecretsMixin):
             logger.info('Starting Docker build of Ansible Container Conductor image (please be patient)...')
             # FIXME: Error out properly if build of conductor fails.
             if self.debug:
-                for line_json in self.client.api.build(fileobj=tarball_file,
-                                                       decode=True,
-                                                       custom_context=True,
-                                                       tag=self.image_name_for_service('conductor'),
-                                                       rm=True,
-                                                       nocache=not cache):
+                for line in self.client.api.build(fileobj=tarball_file,
+                                                  custom_context=True,
+                                                  tag=tag,
+                                                  rm=True,
+                                                  decode=True,
+                                                  nocache=not cache):
                     try:
-                        if line_json.get('status') == 'Downloading':
+                        if line.get('status') == 'Downloading':
                             # skip over lines that give spammy byte-by-byte
                             # progress of downloads
                             continue
-                        elif 'errorDetail' in line_json:
+                        elif 'errorDetail' in line:
                             raise exceptions.AnsibleContainerException(
-                                "Error building conductor image: {0}".format(line_json['errorDetail']['message']))
+                                "Error building conductor image: {0}".format(line['errorDetail']['message']))
                     except ValueError:
                         pass
                     except exceptions.AnsibleContainerException:
@@ -920,12 +1075,12 @@ class Engine(BaseEngine, DockerSecretsMixin):
 
                     # this bypasses the fancy colorized logger for things that
                     # are just STDOUT of a process
-                    plainLogger.debug(text.to_text(line_json.get('stream', json.dumps(line_json))).rstrip())
-                return self.get_latest_image_id_for_service('conductor')
+                    plainLogger.debug(text.to_text(line.get('stream', json.dumps(line))).rstrip())
+                return self.get_image_id_by_tag(tag)
             else:
                 image = self.client.images.build(fileobj=tarball_file,
                                                  custom_context=True,
-                                                 tag=self.image_name_for_service('conductor'),
+                                                 tag=tag,
                                                  rm=True,
                                                  nocache=not cache)
                 return image.id

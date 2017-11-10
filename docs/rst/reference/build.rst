@@ -50,6 +50,14 @@ Define one or more environment variables in the Conductor container. Format each
 
 Mount one or more volumes to the Conductor container. Specify volumes as strings using the Docker volume format.
 
+.. option:: --src-mount-path SRC_MOUNT_PATH
+
+Specify the host path that should be mounted to the conductor at /src. Defaults to the directory from which ansible-container was invoked.
+
+.. option:: --volume-driver VOLUME_DRIVER
+
+Specify volume driver to use when mounting named volumes to the Conductor.
+
 .. option:: --roles-path ROLES_PATH [ROLES_PATH ...]
 
 If using roles not found in the ``roles`` directory within the project, use this option to specify one or more local paths containing the roles. The specified path(s) will be mounted to the conductor container, making the roles available to the build process.
@@ -102,7 +110,7 @@ Unfortunately, there is `a bug <https://github.com/moby/moby/issues/12327>`_ pre
 
 You can resolve this issue by switching to a different graph backend, e.g. `devicemapper`.
 
-.. code-lbock:: bash
+.. code-block:: bash
 
     $ docker info | grep Storage
     Storage Driver: devicemapper

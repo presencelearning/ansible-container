@@ -11,7 +11,6 @@ import getpass
 import gzip
 import hashlib
 import io
-import json
 import os
 import re
 import ruamel
@@ -34,7 +33,8 @@ from six.moves.urllib.parse import urljoin
 
 from .exceptions import AnsibleContainerAlreadyInitializedException,\
                         AnsibleContainerRegistryAttributeException, \
-                        AnsibleContainerException
+                        AnsibleContainerException, \
+                        AnsibleContainerConfigException
 from .utils import *
 from . import __version__, host_only, conductor_only, ENV
 from .config import DEFAULT_CONDUCTOR_BASE
@@ -125,11 +125,35 @@ def hostcmd_init(base_path, project=None, force=False, **kwargs):
                                  **context)
         logger.info('Ansible Container initialized.')
 
+@host_only
+def hostcmd_prebake(distros, debug=False, cache=True, ignore_errors=False):
+    logger.info('Prebaking distros...', distros=distros, cache=cache)
+    engine_obj = load_engine(['BUILD_CONDUCTOR'], 'docker', os.getcwd(), {}, debug=debug)
+    from .docker.engine import PREBAKED_DISTROS
+    for distro in (distros or PREBAKED_DISTROS):
+        logger.info('Now prebaking Conductor image for %s', distro)
+        try:
+            engine_obj.build_conductor_image(os.getcwd(),
+                                             distro,
+                                             prebaking=True,
+                                             cache=cache)
+        except Exception as e:
+            logger.exception('Failure building prebaked image for %s', distro)
+            if ignore_errors:
+                continue
+        except KeyboardInterrupt:
+            if ignore_errors:
+                continue
+
 
 @host_only
 def hostcmd_build(base_path, project_name, engine_name, vars_files=None, **kwargs):
     conductor_cache = kwargs['cache'] and kwargs['conductor_cache']
     config = get_config(base_path, vars_files=vars_files, engine_name=engine_name, project_name=project_name)
+
+    requested_services = kwargs.get('services_to_build')
+    config.check_requested_services(requested_services)
+
     engine_obj = load_engine(['BUILD', 'RUN'],
                              engine_name, config.project_name,
                              config['services'], **kwargs)
@@ -180,10 +204,10 @@ def hostcmd_build(base_path, project_name, engine_name, vars_files=None, **kwarg
         'build', dict(config), base_path, kwargs, save_container=save_container)
 
 @host_only
-def hostcmd_deploy(base_path, project_name, engine_name, vars_files=None,
-                   cache=True, **kwargs):
+def hostcmd_deploy(base_path, project_name, engine_name, vars_files=None, cache=True, vault_files=None, **kwargs):
     assert_initialized(base_path)
-    config = get_config(base_path, vars_files=vars_files, engine_name=engine_name, project_name=project_name)
+    config = get_config(base_path, vars_files=vars_files, engine_name=engine_name, project_name=project_name,
+                        vault_files=vault_files)
     local_images = kwargs.get('local_images')
     output_path = kwargs.pop('deployment_output_path', None) or config.deployment_path
 
@@ -219,6 +243,12 @@ def hostcmd_run(base_path, project_name, engine_name, vars_files=None, cache=Tru
     if not kwargs['production']:
         config.set_env('dev')
 
+    services = kwargs.pop('service')
+    config.check_requested_services(services)
+    config.set_services(services)
+    conductor_env = config.get_conductor_environment() 
+    config.set_conductor_environment(conductor_env)
+
     logger.debug('hostcmd_run configuration', config=config.__dict__)
 
     engine_obj = load_engine(['RUN'],
@@ -231,7 +261,7 @@ def hostcmd_run(base_path, project_name, engine_name, vars_files=None, cache=Tru
         'deployment_output_path': config.deployment_path,
         'host_user_uid': os.getuid(),
         'host_user_gid': os.getgid(),
-        'settings': config.get('settings', {})
+        'settings': config.get('settings', {}), 
     }
     if kwargs:
         params.update(kwargs)
@@ -277,6 +307,10 @@ def hostcmd_stop(base_path, project_name, engine_name, vars_files=None, force=Fa
     if not kwargs['production']:
         config.set_env('dev')
 
+    services = kwargs.pop('service')
+    config.check_requested_services(services)
+    config.set_services(services)
+
     engine_obj = load_engine(['RUN'],
                              engine_name, config.project_name,
                              config['services'], **kwargs)
@@ -300,6 +334,12 @@ def hostcmd_restart(base_path, project_name, engine_name, vars_files=None, force
     config = get_config(base_path, vars_files=vars_files, engine_name=engine_name,  project_name=project_name)
     if not kwargs['production']:
         config.set_env('dev')
+
+    services = kwargs.pop('service')
+    config.check_requested_services(services)
+    config.set_services(services)
+    conductor_env = config.get_conductor_environment()
+    config.set_conductor_environment(conductor_env)
 
     engine_obj = load_engine(['RUN'],
                              engine_name, config.project_name,
@@ -666,11 +706,17 @@ def conductorcmd_build(engine_name, project_name, services, cache=True, local_py
     engine = load_engine(['BUILD'], engine_name, project_name, services, **kwargs)
     logger.info(u'%s integration engine loaded. Build starting.', engine.display_name, project=project_name)
     services_to_build = kwargs.get('services_to_build') or services.keys()
+    logger.debug("Services to build", services_to_build=services_to_build)
     for service_name, service in services.items():
         if service_name not in services_to_build:
             logger.debug('Skipping service %s...', service_name)
             continue
         logger.info(u'Building service...', service=service_name, project=project_name)
+        if not service.get('from'):
+            raise AnsibleContainerConfigException(
+                "Expecting service to have 'from' attribute. None found when evaluating "
+                "service: {}.".format(service_name)
+            )
         cur_image_id = engine.get_image_id_by_tag(service['from'])
         if not cur_image_id:
             cur_image_id = engine.pull_image_by_tag(service['from'])
@@ -762,13 +808,14 @@ def conductorcmd_build(engine_name, project_name, services, cache=True, local_py
                         # No /lib volume
                         pass
                     run_kwargs['environment'].update(dict(
-                         LD_LIBRARY_PATH='/_usr/lib:/_usr/lib64:/_usr/local/lib{}'.format(extra_library_paths),
-                         CPATH='/_usr/include:/_usr/local/include',
+                         LD_LIBRARY_PATH='/usr/lib:/usr/lib64:/_usr/lib:/_usr/lib64:/_usr/local/lib{}'.format(extra_library_paths),
+                         CPATH='/usr/include:/usr/local/include:/_usr/include:/_usr/local/include',
                          PATH='/usr/local/sbin:/usr/local/bin:'
                               '/usr/sbin:/usr/bin:/sbin:/bin:'
                               '/_usr/sbin:/_usr/bin:'
                               '/_usr/local/sbin:/_usr/local/bin',
-                         PYTHONPATH='/_usr/lib/python2.7'))
+                         # PYTHONPATH='/_usr/lib/python2.7'
+                    ))
 
                 container_id = engine.run_container(cur_image_id, service_name, **run_kwargs)
 
@@ -932,9 +979,16 @@ def conductorcmd_push(engine_name, project_name, services, **kwargs):
     username, password = engine.login(username, password, email, url, config_path)
 
     # Push each image that has been built using Ansible roles
-    for service_name, service_config in services.items():
-        if service_config.get('roles'):
+    for name, service in iteritems(services):
+        if service.get('containers'):
+            for c in service['containers']:
+                if 'roles' in c:
+                    cname = '%s-%s' % (name, c['container_name'])
+                    image_id = engine.get_latest_image_id_for_service(cname)
+                    engine.push(image_id, cname, url=url, tag=tag, namespace=namespace, username=username,
+                                password=password, repository_prefix=repository_prefix)
+        elif 'roles' in service:
             # if the service has roles, it's an image we should push
-            image_id = engine.get_latest_image_id_for_service(service_name)
-            engine.push(image_id, service_name, url=url, tag=tag, namespace=namespace, username=username,
+            image_id = engine.get_latest_image_id_for_service(name)
+            engine.push(image_id, name, url=url, tag=tag, namespace=namespace, username=username,
                         password=password, repository_prefix=repository_prefix)
