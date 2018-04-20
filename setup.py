@@ -5,8 +5,14 @@ import shutil
 from setuptools import setup, find_packages
 from setuptools.command.test import test as TestCommand
 from setuptools.command.sdist import sdist as SDistCommand
-from pip.req import parse_requirements
+from distutils.version import LooseVersion
+import pip
 import container
+
+if LooseVersion(pip.__version__) >= "10.0.0":
+    from pip._internal.req import parse_requirements
+else:
+    from pip.req import parse_requirements
 
 
 class PlaybookAsTests(TestCommand):
